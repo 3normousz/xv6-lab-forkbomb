@@ -3,6 +3,7 @@
 #include "kernel/types.h"
 #include "user/user.h"
 #include "kernel/fcntl.h"
+#include "kernel/param.h"
 
 // Parsed command representation
 #define EXEC  1
@@ -53,6 +54,28 @@ int fork1(void);  // Fork but panics on failure.
 void panic(char*);
 struct cmd *parsecmd(char*);
 void runcmd(struct cmd*) __attribute__((noreturn));
+
+// jobs tracking (Step 3)
+static int jobs[NPROC];
+static int interactive = 1;
+
+static void add_job(int pid) {
+  for (int i = 0; i < NPROC; i++) {
+    if (jobs[i] == 0) { jobs[i] = pid; return; }
+  }
+}
+
+static void remove_job(int pid) {
+  for (int i = 0; i < NPROC; i++) {
+    if (jobs[i] == pid) { jobs[i] = 0; return; }
+  }
+}
+
+static void print_jobs(void) {
+  for (int i = 0; i < NPROC; i++) {
+    if (jobs[i] != 0) printf("%d\n", jobs[i]);
+  }
+}
 
 // Execute cmd.  Never returns.
 void
@@ -134,7 +157,30 @@ runcmd(struct cmd *cmd)
 int
 getcmd(char *buf, int nbuf)
 {
-  write(2, "$ ", 2);
+  int status, pid;
+
+  while ((pid = wait_noblock(&status)) > 0) {
+    remove_job(pid);
+    printf("[bg %d] exited with status %d\n", pid, status);
+  }
+
+  // If there are background jobs, give them a brief tick to finish
+  // so we can print their exit before showing the next prompt.
+    if (interactive) {
+      int have_jobs = 0;
+      for (int i = 0; i < NPROC; i++) if (jobs[i] != 0) { have_jobs = 1; break; }
+      if (have_jobs) {
+        sleep(1);
+        while ((pid = wait_noblock(&status)) > 0) {
+          remove_job(pid);
+          printf("[bg %d] exited with status %d\n", pid, status);
+        }
+      }
+    }
+
+  if (interactive)
+    write(2, "$ ", 2);
+
   memset(buf, 0, nbuf);
   gets(buf, nbuf);
   if(buf[0] == 0) // EOF
@@ -143,7 +189,7 @@ getcmd(char *buf, int nbuf)
 }
 
 int
-main(void)
+main(int argc, char* argv[])
 {
   static char buf[100];
   int fd;
@@ -156,18 +202,85 @@ main(void)
     }
   }
 
+  // If run with a script file (non-interactive), redirect stdin.
+  if (argc > 1) {
+    int f = open(argv[1], O_RDONLY);
+    if (f < 0) {
+      printf("sh: cannot open %s\n", argv[1]);
+      // fall back to interactive stdin
+    } else {
+      close(0);
+      dup(f);
+      close(f);
+      interactive = 0;
+    }
+  }
+
   // Read and run input commands.
   while(getcmd(buf, sizeof(buf)) >= 0){
+    // built-in: cd
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
-      // Chdir must be called by the parent, not the child.
       buf[strlen(buf)-1] = 0;  // chop \n
       if(chdir(buf+3) < 0)
         fprintf(2, "cannot cd %s\n", buf+3);
       continue;
     }
-    if(fork1() == 0)
-      runcmd(parsecmd(buf));
-    wait(0);
+
+    // built-in: jobs (accepts "jobs" or "jobs\n")
+    if (buf[0]=='j' && buf[1]=='o' && buf[2]=='b' && buf[3]=='s' &&
+        (buf[4]==0 || buf[4]=='\n')) {
+      print_jobs();
+      continue;
+    }
+
+    // AFTER input: reap finished background jobs before executing non-builtins
+    {
+      int status, pid;
+      while ((pid = wait_noblock(&status)) > 0) {
+        remove_job(pid);
+        printf("[bg %d] exited with status %d\n", pid, status);
+      }
+        if (interactive) {
+          int have_jobs = 0;
+          for (int i = 0; i < NPROC; i++) if (jobs[i] != 0) { have_jobs = 1; break; }
+          if (have_jobs) {
+            sleep(1);
+            while ((pid = wait_noblock(&status)) > 0) {
+              remove_job(pid);
+              printf("[bg %d] exited with status %d\n", pid, status);
+            }
+          }
+        }
+    }
+
+    struct cmd *cmd = parsecmd(buf);
+    if(cmd && cmd->type == BACK){
+      int pid = fork1();
+      if(pid == 0){
+        struct backcmd *bcmd = (struct backcmd*)cmd;
+        runcmd(bcmd->cmd);
+      } else {
+        add_job(pid);
+        printf("[%d]\n", pid);
+      }
+    } else {
+      int fgpid = fork1();
+      if(fgpid == 0)
+        runcmd(cmd);
+      // Wait for the foreground child specifically.
+      // If other background children exit first, report them here.
+      for(;;){
+        int status;
+        int rp = wait(&status);
+        if(rp < 0)
+          break;
+        if(rp == fgpid)
+          break;
+        // A background job has exited.
+        remove_job(rp);
+        printf("[bg %d] exited with status %d\n", rp, status);
+      }
+    }
   }
   exit(0);
 }

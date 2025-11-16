@@ -693,3 +693,29 @@ procdump(void)
     printf("\n");
   }
 }
+
+int wait_noblock(uint64 exit_status) {
+  struct proc *p = myproc();
+
+  acquire(&wait_lock);
+  for(struct proc *pp = proc; pp < &proc[NPROC]; pp++){
+    if(pp->parent == p){
+      acquire(&pp->lock);
+      if(pp->state == ZOMBIE){
+        int pid = pp->pid;
+        if(copyout(p->pagetable, exit_status, (char *)&pp->xstate, sizeof(int)) < 0){
+          release(&pp->lock);
+          release(&wait_lock);
+          return -1;
+        }
+        freeproc(pp);
+        release(&pp->lock);
+        release(&wait_lock);
+        return pid;
+      }
+      release(&pp->lock);
+    }
+  }
+  release(&wait_lock);
+  return 0; // no zombie child
+}
